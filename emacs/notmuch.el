@@ -897,10 +897,103 @@ sets the :orig-tag property."
 (defvar-local notmuch--search-hook-run nil
   "Flag used to ensure the notmuch-search-hook is only run once per buffer")
 
+(defcustom notmuch-progressive-search nil
+  "Enable progressive search.
+When set to non nil, notmuch-search process is paused until viewport
+reach the end of the buffer. Use the notmuch-flush-buffer to force
+read all the messages."
+  :type 'boolean
+  :group 'notmuch-search)
+
 (defun notmuch--search-hook-wrapper ()
   (unless notmuch--search-hook-run
     (setq notmuch--search-hook-run t)
     (run-hooks 'notmuch-search-hook)))
+
+(defvar notmuch--paused-procs nil
+  "The list of notmuch search buffer that are paused.")
+(defvar notmuch--procs-to-flush nil
+  "The list of notmuch search buffer the user requested to be flushed.")
+(defvar notmuch--search-gc-timer nil
+  "The buffer process garbage collector timer.")
+
+(defconst notmuch--search-stop-limit -16384
+  "The number of points between buffer and window to stop the search process.")
+(defconst notmuch--search-cont-limit 8192
+  "The number of points between window and buffer to cont the search process.")
+(defconst notmuch--search-process-ttl 3600
+  "The number of seconds before a paused search process is killed.")
+
+(defun notmuch--terminate (proc)
+  "Send sigterm to process group"
+  (message "DEBUG(term): Sending SIGTERM to %d (%s)" (process-id proc) (current-buffer))
+  (signal-process proc 15)
+  (notmuch--paused-procs-remove proc t)
+  (delete-process proc))
+
+(defun notmuch--paused-procs-gc ()
+  "Cleanup old paused processes and the one associated with killed buffers."
+  (message "DEBUG(gc): called at %s" (current-time-string))
+  (dolist (proc notmuch--paused-procs)
+    (let ((buffer (process-buffer proc)))
+      (message "DEBUG(gc): processing %S associated with %S (starttime %S)"
+               proc buffer (car (cdr (alist-get 'etime (process-attributes (process-id proc))))))
+      (unless (buffer-live-p buffer)
+        (message "DEBUG(gc): Deleting because buffer is killed")
+        (notmuch--terminate proc))
+      (if (member (process-status proc) '(run stop))
+          (unless (<= (car (cdr (alist-get 'etime (process-attributes (process-id proc)))))
+                      notmuch--search-process-ttl)
+            (message "DEBUG(gc): Deleting because process is too old")
+            (notmuch--terminate proc))
+        (message "DEBUG(gc): Deleting because process is dead")
+        (notmuch--paused-procs-remove proc nil))))
+  (dolist (proc notmuch--procs-to-flush)
+    (unless (process-live-p proc)
+        (setq notmuch--procs-to-flush (delete proc notmuch--procs-to-flush))))
+  (when (and (timerp notmuch--search-gc-timer)
+             (not notmuch--paused-procs)
+             (not notmuch--procs-to-flush))
+    (message "DEBUG(gc): removing the timer")
+    ;; Remove un-needed timer
+    (cancel-timer notmuch--search-gc-timer)))
+
+(defun notmuch--paused-procs-remove (proc resume)
+  "Remove PROC from the paused list and send SIGCONT when resume is t"
+  (when resume
+    ;; Send SIGCONT signal
+    (message "DEBUG(r): Sending SIGCONT to %d (%s)" (process-id proc) (current-buffer))
+    (signal-process proc 18))
+  (setq notmuch--paused-procs (delete proc notmuch--paused-procs))
+  (message "DEBUG(r) paused-procs are %S" notmuch--paused-procs)
+  (unless notmuch--paused-procs
+    ;; Remove un-needed scroll hook
+    (remove-hook 'window-scroll-functions 'notmuch--scroller)))
+
+(defun notmuch-flush-buffer ()
+  "Manually flush the search process stdout associated with the current buffer."
+  (interactive)
+  (let ((proc (get-buffer-process (current-buffer))))
+    (if (not (member proc notmuch--paused-procs))
+        (error "Notmuch search process is not paused")
+      (message "DEBUG(fb): Adding %S to the flush list for buffer %S" proc (current-buffer))
+      (add-to-list 'notmuch--procs-to-flush proc)
+      (notmuch--paused-procs-remove proc t)))
+  (message "DEBUG(fb): procs-to-flush are %S" notmuch--procs-to-flush))
+
+(defun notmuch--scroller (window window-start)
+  "Resume search process when WINDOW reaches the end of the buffer.
+
+This is added to the 'window-scroll-functions' when a search process is stopped.
+WINDOW-START unused."
+  ;; (message "DEBUG(s): scroller position %d (%s)"
+  ;;   (- (point-max) (window-end) notmuch--search-cont-limit) (current-buffer))
+  (when (<= (- (point-max) (window-end) notmuch--search-cont-limit) 0)
+    ;; Window is near the end of the buffer
+    (let ((proc (get-buffer-process (current-buffer))))
+      (when (and proc (member proc notmuch--paused-procs))
+        ;; Buffer is a stopped notmuch buffer
+        (notmuch--paused-procs-remove proc t)))))
 
 (defun notmuch-search-process-filter (proc string)
   "Process and filter the output of \"notmuch search\"."
@@ -916,7 +1009,27 @@ sets the :orig-tag property."
 	(notmuch-sexp-parse-partial-list 'notmuch-search-append-result
 					 results-buf))
       (with-current-buffer results-buf
-	(notmuch--search-hook-wrapper)))))
+	(notmuch--search-hook-wrapper))))
+
+  ;; (message "DEBUG(p): parser position %d" (- (window-end) (point-max) notmuch-search-stop-limit))
+  (if (and (equal notmuch-progressive-search t)              ; progressive search is turned on
+           (not (member proc notmuch--procs-to-flush))       ; proc isn't part of the flush list
+           (<= (- (window-end) (point-max)                   ; window is far from the end of buffer
+                  notmuch--search-stop-limit)
+               0))
+      (unless (member proc notmuch--paused-procs)
+        (unless notmuch--paused-procs
+            ;; First buffer to be stopped, add the scroll hook
+            (add-hook 'window-scroll-functions 'notmuch--scroller))
+        ;; Add to the paused list
+        (add-to-list 'notmuch--paused-procs proc)
+        ;; Send SIGSTOP signal
+        (message "DEBUG(p): Sending SIGSTOP to %d (%s))" (process-id proc) (current-buffer))
+        (signal-process proc 19)
+        (message "DEBUG(p): paused-procs are: %S" notmuch--paused-procs)
+        (unless (timerp notmuch--search-gc-timer)
+          ;; Ensure gc is started
+          (setq notmuch--search-gc-timer (run-at-time 60 60 #'notmuch--paused-procs-gc))))))
 
 ;;; Commands (and some helper functions used by them)
 
@@ -1067,6 +1180,7 @@ the configured default sort order."
 	(set-buffer buffer)
       (pop-to-buffer-same-window buffer))
     (notmuch-search-mode)
+    (notmuch--paused-procs-gc)
     ;; Don't track undo information for this buffer
     (setq buffer-undo-list t)
     (setq notmuch-search-query-string query)
@@ -1075,7 +1189,10 @@ the configured default sort order."
     (setq notmuch-search-target-line target-line)
     (notmuch-tag-clear-cache)
     (when (get-buffer-process buffer)
-      (error "notmuch search process already running for query `%s'" query))
+          (if (not (member proc notmuch--paused-procs))
+              (error "notmuch search process already running for query `%s'" query)
+            (notmuch--terminate proc)))
+
     (let ((inhibit-read-only t))
       (erase-buffer)
       (goto-char (point-min))
